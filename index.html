@@ -458,12 +458,12 @@ function ic(n,o){ o=o||{}; const s=o.size||24, w=o.sw||1.9;
 const API_URL='https://script.google.com/macros/s/AKfycbxmysWF7OZ4tuQr-mPRcxKkV6R5aQxpCv-eMz8QLtfpbPNFIMtp3immCfRanwWFV5hZ/exec';
 
 let _cbSeq=0;
-function _jsonp(action,payload){
+function _jsonp(action,payload,ms){
   return new Promise((resolve,reject)=>{
     if(!API_URL||API_URL.indexOf('PASTE_YOUR')>=0){ reject(new Error('ยังไม่ได้ตั้งค่า API_URL')); return; }
     const cb='__cb'+(++_cbSeq)+'_'+Date.now();
     const s=document.createElement('script');
-    const timer=setTimeout(()=>{ done(); reject(new Error('timeout')); },25000);
+    const timer=setTimeout(()=>{ done(); reject(new Error('timeout')); },ms||20000);
     function done(){ try{delete window[cb];}catch(e){window[cb]=undefined;} if(s.parentNode)s.parentNode.removeChild(s); clearTimeout(timer); }
     window[cb]=(data)=>{ done(); resolve(data); };
     s.onerror=()=>{ done(); reject(new Error('network')); };
@@ -505,14 +505,24 @@ function _postLarge(action,payload){
   return fetch(API_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:body})
     .catch(()=>null).then(()=>poll(0));
 }
+/* คำสั่งที่ "อ่านอย่างเดียว" ลองใหม่อัตโนมัติ 1 ครั้งถ้าเน็ตสะดุด/เซิร์ฟเวอร์ตอบช้า (ผู้ใช้ไม่ต้องกดซ้ำเอง) */
+const _RETRY={login:1,getBootstrap:1,getMonthLeaves:1,listStaff:1,listAssignments:1,getAssignment:1,getPublishedAssignment:1,getMyProfile:1};
 function callServer(action,...args){
   const p=_argsToPayload(action,args);
   if(encodeURIComponent(JSON.stringify(p)).length>6000) return _postLarge(action,p);
-  return _jsonp(action,p);
+  return _jsonp(action,p,15000).catch(e=>{
+    if(!_RETRY[action]||String(e&&e.message).indexOf('API_URL')>=0) throw e;
+    return new Promise(ok=>setTimeout(ok,500)).then(()=>_jsonp(action,p,25000));
+  });
 }
+/* ปลุกเซิร์ฟเวอร์ Google ล่วงหน้าตอนเปิดหน้าล็อกอิน (ระหว่างที่ผู้ใช้พิมพ์ User/PIN) */
+function warmUp(){ try{ _jsonp('ping',{},20000).catch(()=>{}); }catch(e){} }
 function saveToken(t){ try{localStorage.setItem('mrikcmh_token',t);}catch(e){} }
 function readToken(){ try{return localStorage.getItem('mrikcmh_token');}catch(e){return null;} }
-function clearToken(){ try{localStorage.removeItem('mrikcmh_token');}catch(e){} }
+function clearToken(){ try{localStorage.removeItem('mrikcmh_token');localStorage.removeItem('mrikcmh_boot');}catch(e){} }
+/* เก็บข้อมูลล่าสุดไว้ในเครื่อง → เปิดแอปครั้งต่อไปแสดงผลได้ทันที แล้วค่อยอัปเดตจากเซิร์ฟเวอร์เบื้องหลัง */
+function saveBoot(b){ try{localStorage.setItem('mrikcmh_boot',JSON.stringify(b));}catch(e){} }
+function readBoot(){ try{const b=JSON.parse(localStorage.getItem('mrikcmh_boot')||'null'); return (b&&b.ok)?b:null;}catch(e){return null;} }
 
 /* ---- utils ---- */
 function ltColor(name){ const t=(state.leaveTypes||[]).find(x=>x.name===name)||FALLBACK_TYPES.find(x=>x.name===name); return t?t.color:'#64748b'; }
@@ -560,33 +570,65 @@ function updateHeader(){
 /* ---- เริ่มต้น ---- */
 window.addEventListener('load',()=>{
   const t=readToken();
-  if(!t){ showLogin(); return; }
+  if(!t){ showLogin(); if(typeof warmUp==='function') warmUp(); return; }
   state.token=t;
+  const cached=readBoot();
+  if(cached){ applyBootstrap(cached,true); enterApp(); }        // เปิดได้ทันทีจากข้อมูลล่าสุดในเครื่อง
   callServer('getBootstrap',t).then(res=>{
-    if(res&&res.ok){ applyBootstrap(res); enterApp(); } else { clearToken(); showLogin(); }
-  }).catch(()=>showLogin());
+    if(res&&res.ok){ applyBootstrap(res); if(cached) softRerender(); else enterApp(); }
+    else if(res&&res.code==='AUTH'){ logout(); }
+    else if(!cached){ showLogin(); }
+  }).catch(()=>{ if(!cached) showLogin(); else toast('เชื่อมต่อไม่สำเร็จ — แสดงข้อมูลล่าสุด','err'); });
 });
+/* อัปเดตหน้าจอที่กำลังเปิดอยู่ด้วยข้อมูลใหม่ (ไม่รบกวนถ้ากำลังกรอกฟอร์ม/เปิดหน้าต่างอยู่) */
+function softRerender(){
+  setTopAvatar(); updateHeader(); renderNav();
+  if($('#modalRoot').innerHTML) return;
+  const f={home:renderHome,history:renderHistory,approve:renderApprove}[state.tab];
+  if(f) f();
+}
 function showLogin(){ $('#splash').classList.add('hidden'); $('#mainApp').classList.add('hidden'); $('#loginScreen').classList.remove('hidden'); }
+function _busyNote(el,ms){ return setTimeout(()=>{ if(el){ el.style.color='var(--muted)'; el.textContent='กำลังเชื่อมต่อเซิร์ฟเวอร์ อาจใช้เวลาสักครู่…'; } },ms||3500); }
 
 /* ---- Login ---- */
+let _loggingIn=false;
 function doLogin(){
+  if(_loggingIn) return;                                   // กันกดซ้ำ/กด Enter ซ้ำระหว่างรอ
   const id=$('#inpEmpId').value.trim(), pin=$('#inpPin').value.trim();
-  const err=$('#loginErr'); err.textContent='';
+  const err=$('#loginErr'); err.textContent=''; err.style.color='';
   if(!id||!pin){ err.textContent='กรุณากรอก User และ PIN'; return; }
   const btn=$('#btnLogin'); btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
+  _loggingIn=true;
+  const slow=_busyNote(err);
+  const reset=(msg)=>{ _loggingIn=false; clearTimeout(slow); btn.disabled=false; btn.textContent='เข้าสู่ระบบ';
+    err.style.color=''; err.textContent=msg||''; };
+  // ปุ่มหมุนต่อจนกว่าจะเข้าแอปได้จริง (เดิมปุ่มกลับมาก่อนโหลดข้อมูลเสร็จ ทำให้ดูเหมือนกดไม่ติด)
+  const enter=(b)=>{ reset(); applyBootstrap(b); enterApp(); };
   callServer('login',id,pin).then(res=>{
-    btn.disabled=false; btn.textContent='เข้าสู่ระบบ';
-    if(!res.ok){ err.textContent=res.message||'เข้าสู่ระบบไม่สำเร็จ'; return; }
+    if(!res||!res.ok){ reset((res&&res.message)||'เข้าสู่ระบบไม่สำเร็จ'); return; }
     state.token=res.token; saveToken(res.token); state.user=res.user; $('#inpPin').value='';
-    callServer('getBootstrap',res.token).then(b=>{ if(b.ok){ applyBootstrap(b); enterApp(); } });
-  }).catch(e=>{ btn.disabled=false; btn.textContent='เข้าสู่ระบบ'; err.textContent='เชื่อมต่อไม่สำเร็จ ลองใหม่'; });
+    if(res.boot&&res.boot.ok){ enter(res.boot); return; }           // เซิร์ฟเวอร์ใหม่ส่งข้อมูลมาพร้อมกันเลย
+    return callServer('getBootstrap',res.token).then(b=>{
+      if(b&&b.ok) enter(b); else reset((b&&b.message)||'โหลดข้อมูลไม่สำเร็จ ลองใหม่'); });
+  }).catch(()=>{ reset('เชื่อมต่อไม่สำเร็จ ลองใหม่อีกครั้ง'); });
 }
 function avatarInner(photo,name){ return photo? `<img src="${photo}" alt="" style="width:100%;height:100%;object-fit:cover">` : esc(initials(name)); }
 function setTopAvatar(){ const el=$('#tbAvatar'); if(el) el.innerHTML=avatarInner(state.user&&state.user.photo, state.user&&state.user.Name); }
-function applyBootstrap(res){
+function applyBootstrap(res,fromCache){
   state.user=res.user; if(state.user){ state.user.photo=res.photo||''; state.user.sex=res.sex||''; state.user.incharge=!!res.incharge; }
   state.leaveTypes=(res.leaveTypes&&res.leaveTypes.length)?res.leaveTypes:FALLBACK_TYPES;
   state.myRequests=res.myRequests||[]; state.pending=res.pending||[]; state.calCache={};
+  // ข้อมูลที่เซิร์ฟเวอร์แนบมาล่วงหน้า → เปิดแท็บปฏิทิน / Assignment / โปรไฟล์ ได้ทันทีไม่ต้องรอ
+  if(res.month&&res.month.ym) state.calCache[res.month.ym]=res.month.leaves||[];
+  if('published' in res){ const a=res.published; state.assign.published=a?Object.assign({},a,{grid:normGrid(a.grid)}):null; state.assign.pubLoaded=true; }
+  if(res.profile) state.pf=res.profile;
+  if(Array.isArray(res.assignments)){ state.assign.list=res.assignments; state.assign.listLoaded=true; }
+  if(!fromCache) saveBoot(res);
+}
+/* หลังบันทึก: ใช้ข้อมูลล่าสุดที่เซิร์ฟเวอร์แนบมา (ไม่ต้องโหลดซ้ำ) */
+function afterWrite(res){
+  if(res&&res.boot&&res.boot.ok){ applyBootstrap(res.boot); renderNav(); return Promise.resolve(); }
+  return refresh();
 }
 function enterApp(){
   $('#splash').classList.add('hidden'); $('#loginScreen').classList.add('hidden'); $('#mainApp').classList.remove('hidden');
@@ -595,9 +637,10 @@ function enterApp(){
   renderNav(); go('home');
 }
 function refresh(){ return callServer('getBootstrap',state.token).then(res=>{ if(res.ok){
-  state.myRequests=res.myRequests||[]; state.pending=res.pending||[]; state.calCache={}; renderNav(); }
-  else if(res.code==='AUTH'){ logout(); } }); }
+  applyBootstrap(res); renderNav(); }
+  else if(res.code==='AUTH'){ logout(); } }).catch(()=>{}); }
 function logout(){ clearToken(); state.token=null;state.user=null; closeSheet();
+  state.pf=null; state.staff=[]; state.assign={list:[],current:null,names:[],published:null}; state.calCache={};
   $('#mainApp').classList.add('hidden'); $('#loginScreen').classList.remove('hidden');
   $('#inpEmpId').value=''; $('#inpPin').value=''; $('#loginErr').textContent=''; }
 
@@ -719,7 +762,7 @@ function submitLeave(){
     totalDays:f.totalDays,reason:reason,contact:contact}).then(res=>{
     btn.disabled=false; btn.textContent='ส่งใบลา';
     if(!res.ok){ if(res.code==='AUTH'){toast('เซสชันหมดอายุ','err');logout();return;} err.textContent=res.message||'ส่งไม่สำเร็จ'; return; }
-    toast('ส่งใบลาเรียบร้อย ✓','ok'); refresh().then(()=>go('history'));
+    toast('ส่งใบลาเรียบร้อย ✓','ok'); afterWrite(res).then(()=>go('history'));
   }).catch(e=>{ btn.disabled=false; btn.textContent='ส่งใบลา'; err.textContent='เชื่อมต่อไม่สำเร็จ ลองใหม่'; });
 }
 
@@ -744,12 +787,23 @@ function renderCalendar(){
   if(!state.calYm) state.calYm=ymOf(new Date());
   $('#content').innerHTML='<div class="screen" id="calScreen"><div class="card"><div class="empty"><div class="spinner" style="border-color:var(--line);border-top-color:var(--brand)"></div></div></div></div>';
   const ym=state.calYm;
-  const done=(leaves)=>{ state.calCache[ym]=leaves; drawCalendar(ym,leaves); };
-  if(state.calCache[ym]) { drawCalendar(ym,state.calCache[ym]); return; }
-  callServer('getMonthLeaves',state.token,ym).then(res=>{
+  const done=(leaves)=>{ state.calCache[ym]=leaves; if(state.tab==='calendar'&&state.calYm===ym) drawCalendar(ym,leaves); calPrefetch(ym); };
+  if(state.calCache[ym]) { drawCalendar(ym,state.calCache[ym]); calPrefetch(ym); return; }
+  calFetch(ym).then(res=>{
     if(!res.ok){ if(res.code==='AUTH'){logout();return;} done([]); return; }
     done(res.leaves||[]);
   }).catch(()=>done([]));
+}
+const _calInflight={};
+function calFetch(ym){
+  if(!_calInflight[ym]) _calInflight[ym]=callServer('getMonthLeaves',state.token,ym).finally(()=>{ delete _calInflight[ym]; });
+  return _calInflight[ym];
+}
+/* โหลดเดือนก่อน/ถัดไปรอไว้ล่วงหน้า → กด ‹ › แล้วขึ้นทันที */
+function calPrefetch(ym){
+  const [y,m]=ym.split('-').map(Number);
+  [-1,1].forEach(dx=>{ const k=ymOf(new Date(y,m-1+dx,1)); if(state.calCache[k]||_calInflight[k]) return;
+    calFetch(k).then(r=>{ if(r&&r.ok) state.calCache[k]=r.leaves||[]; }).catch(()=>{}); });
 }
 function calShift(delta){
   const [y,m]=state.calYm.split('-').map(Number);
@@ -844,8 +898,8 @@ function closeSheet(){ $('#modalRoot').innerHTML=''; }
 function cancelLeave(rid){
   callServer('cancelLeave',state.token,rid).then(res=>{
     if(!res.ok){ toast(res.message||'ยกเลิกไม่สำเร็จ','err'); return; }
-    closeSheet(); toast('ยกเลิกใบลาแล้ว','ok'); refresh().then(()=>go(state.tab));
-  });
+    closeSheet(); toast('ยกเลิกใบลาแล้ว','ok'); afterWrite(res).then(()=>go(state.tab));
+  }).catch(()=>toast('เชื่อมต่อไม่สำเร็จ','err'));
 }
 function decide(rid,decision){
   const comment=($('#apprComment')||{}).value||'';
@@ -853,16 +907,21 @@ function decide(rid,decision){
   callServer('decide',state.token,rid,decision,comment).then(res=>{
     if(!res.ok){ btns.forEach(b=>b.disabled=false); toast(res.message||'ดำเนินการไม่สำเร็จ','err'); return; }
     closeSheet(); toast(decision==='อนุมัติ'?'อนุมัติเรียบร้อย ✓':'บันทึกไม่อนุมัติแล้ว','ok');
-    refresh().then(()=>go('approve'));
-  });
+    afterWrite(res).then(()=>go('approve'));
+  }).catch(()=>{ btns.forEach(b=>b.disabled=false); toast('เชื่อมต่อไม่สำเร็จ','err'); });
 }
 
 /* ---- Staff management (ADMIN) ---- */
 function renderStaff(){
-  $('#content').innerHTML='<div class="screen"><div class="card"><div class="empty"><div class="spinner" style="border-color:var(--line);border-top-color:var(--brand)"></div></div></div></div>';
+  if(state.staff&&state.staff.length) drawStaff();          // แสดงรายชื่อเดิมทันที แล้วอัปเดตเบื้องหลัง
+  else $('#content').innerHTML='<div class="screen"><div class="card"><div class="empty"><div class="spinner" style="border-color:var(--line);border-top-color:var(--brand)"></div></div></div></div>';
   callServer('listStaff',state.token).then(res=>{
+    if(state.tab!=='staff') return;
     if(!res.ok){ if(res.code==='AUTH'){logout();return;} $('#content').innerHTML='<div class="card"><div class="empty"><p>'+esc(res.message||'โหลดไม่สำเร็จ')+'</p></div></div>'; return; }
-    state.staff=res.staff||[];
+    state.staff=res.staff||[]; state.assign.names=state.staff.map(s=>s.Name); drawStaff();
+  }).catch(()=>{ if(!(state.staff&&state.staff.length)) $('#content').innerHTML=cardMsg('เชื่อมต่อไม่สำเร็จ'); });
+}
+function drawStaff(){
     const list=state.staff.map(s=>`<div class="staff-item">
       <span class="st-av">${initials(s.Name)}</span>
       <div class="st-body"><div class="st-name">${esc(s.Name)}</div>
@@ -872,7 +931,6 @@ function renderStaff(){
       <div style="font-size:13px;color:var(--muted);margin:2px 2px 10px">ทั้งหมด ${state.staff.length} คน</div>
       <div class="card">${list}</div></div>
       <button class="fab" onclick="openStaffForm(null)">${ic('plus',{size:26})}</button>`;
-  });
 }
 function openStaffForm(s){
   const isEdit=!!s;
@@ -898,7 +956,8 @@ function saveStaff(targetUser){
   const name=$('#stName').value.trim(), user=$('#stUser').value.trim(), pin=$('#stPin').value.trim(), pos=state.form.stPos||'STAFF';
   const btn=$('#stSave'); btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
   const done=(res)=>{ btn.disabled=false; if(!res.ok){ err.textContent=res.message||'บันทึกไม่สำเร็จ'; return; }
-    closeSheet(); toast('บันทึกแล้ว ✓','ok'); renderStaff(); };
+    closeSheet(); toast('บันทึกแล้ว ✓','ok');
+    if(res.staff){ state.staff=res.staff; state.assign.names=res.staff.map(s=>s.Name); drawStaff(); } else renderStaff(); };
   const fail=()=>{ btn.disabled=false; err.textContent='เชื่อมต่อไม่สำเร็จ'; };
   if(targetUser){ callServer('updateStaff',state.token,targetUser,{name:name,pin:pin,position:pos}).then(done).catch(fail); }
   else{
@@ -939,12 +998,20 @@ function myDutyBandHTML(grid){
 
 /* ---- STAFF / published (read-only) ---- */
 function renderAssignView(){
-  cardBusy();
+  const had=state.assign.pubLoaded;
+  if(had) drawAssignView(state.assign.published); else cardBusy();   // มีข้อมูลแล้ว → แสดงทันที
   callServer('getPublishedAssignment',state.token).then(res=>{
-    if(!res.ok){ if(res.code==='AUTH'){logout();return;} $('#content').innerHTML=cardMsg(res.message||'โหลดไม่สำเร็จ'); return; }
-    const a=res.assignment;
+    if(state.tab!=='assign') return;
+    if(!res.ok){ if(res.code==='AUTH'){logout();return;} if(!had) $('#content').innerHTML=cardMsg(res.message||'โหลดไม่สำเร็จ'); return; }
+    const a=res.assignment, old=state.assign.published;
+    state.assign.pubLoaded=true;
+    if(had && ((!a&&!old) || (a&&old&&a.id===old.id&&a.updatedAt===old.updatedAt))) return;   // ไม่มีอะไรเปลี่ยน
+    drawAssignView(a?Object.assign({},a,{grid:normGrid(a.grid)}):null);
+  }).catch(()=>{ if(!had) $('#content').innerHTML=cardMsg('เชื่อมต่อไม่สำเร็จ'); });
+}
+function drawAssignView(a){
     if(!a){ state.assign.published=null; $('#content').innerHTML='<div class="screen"><div class="card"><div class="empty"><div class="ic">'+ic("calendar",{size:46,sw:1.5})+'</div><p>ยังไม่มีตารางที่เผยแพร่</p></div></div></div>'; return; }
-    a.grid=normGrid(a.grid); state.assign.published=a;
+    state.assign.published=a;
     const hasNote=a.grid.some(function(row){ return row.some(function(c){ return cellN(c); }); });
     $('#content').innerHTML=`<div class="screen">
       <div class="section-title" style="font-size:16px">${esc(a.title)||'ตาราง Assignment'}</div>
@@ -952,7 +1019,6 @@ function renderAssignView(){
       ${myDutyBandHTML(a.grid)}
       <div class="grid-scroll freeze">${gridReadHTML(a.grid)}</div>
       ${hasNote?'<div class="asg-hint" style="margin-top:8px"><span class="note-dot"></span> = มีหมายเหตุ · แตะที่ชื่อเพื่อดู</div>':''}</div>`;
-  }).catch(()=>{ $('#content').innerHTML=cardMsg('เชื่อมต่อไม่สำเร็จ'); });
 }
 function gridReadHTML(grid){
   grid=grid||[]; if(!grid.length) return '<div class="empty" style="padding:24px"><p>ตารางว่าง</p></div>';
@@ -976,16 +1042,23 @@ function showNote(r,c){
 
 /* ---- ADMIN: list ---- */
 function renderAssignList(){
-  cardBusy();
+  const had=!!state.assign.listLoaded;
+  if(had) drawAssignList(); else cardBusy();                 // แสดงรายการเดิมทันที แล้วอัปเดตเบื้องหลัง
   Promise.all([
     callServer('listAssignments',state.token),
     callServer('getPublishedAssignment',state.token).catch(function(){return null;})
   ]).then(function(vals){
     const res=vals[0], pubRes=vals[1];
-    if(!res.ok){ if(res.code==='AUTH'){logout();return;} $('#content').innerHTML=cardMsg(res.message||'โหลดไม่สำเร็จ'); return; }
-    state.assign.list=res.assignments||[];
-    const pub=(pubRes&&pubRes.ok)?pubRes.assignment:null;
-    const band=pub?myDutyBandHTML(normGrid(pub.grid)):'';
+    if(state.tab!=='assign') return;
+    if(!res.ok){ if(res.code==='AUTH'){logout();return;} if(!had) $('#content').innerHTML=cardMsg(res.message||'โหลดไม่สำเร็จ'); return; }
+    state.assign.list=res.assignments||[]; state.assign.listLoaded=true;
+    if(pubRes&&pubRes.ok){ const a=pubRes.assignment; state.assign.published=a?Object.assign({},a,{grid:normGrid(a.grid)}):null; state.assign.pubLoaded=true; }
+    drawAssignList();
+  }).catch(()=>{ if(!had) $('#content').innerHTML=cardMsg('เชื่อมต่อไม่สำเร็จ'); });
+}
+function drawAssignList(){
+    const pub=state.assign.published;
+    const band=pub?myDutyBandHTML(pub.grid):'';
     const items=state.assign.list.map(a=>`<div class="asg-item" onclick="openAssignEditor('${a.id}')">
         <div class="ai-body"><div class="ai-title">${esc(a.title)||'(ไม่มีชื่อ)'}</div>
           <div class="ai-meta">อัปเดต ${esc(a.updatedAt)||'-'}${a.updatedBy?(' · '+esc(a.updatedBy)):''}</div></div>
@@ -996,7 +1069,6 @@ function renderAssignList(){
       <div class="asg-hint">แตะเพื่อแก้ไข · จะมีเฉพาะอันที่ "เผยแพร่" ที่ STAFF เห็น (เผยแพร่ได้ทีละ 1)</div>
       <div class="card">${items||'<div class="empty"><div class="ic">'+ic("calendar",{size:46,sw:1.5})+'</div><p>ยังไม่มีตาราง กดปุ่ม + เพื่อสร้าง</p></div>'}</div>
     </div><button class="fab" onclick="openAssignEditor(null)">${ic('plus',{size:26})}</button>`;
-  }).catch(()=>{ $('#content').innerHTML=cardMsg('เชื่อมต่อไม่สำเร็จ'); });
 }
 
 /* ---- ADMIN: editor ---- */
@@ -1102,15 +1174,15 @@ function saveCell(r,c,clear){
 function asgSaveDraft(){ _syncTitle(); const a=state.assign.current;
   return callServer('saveAssignment',state.token,{id:a.id,title:a.title,grid:a.grid}).then(res=>{
     if(!res.ok){ if(res.code==='AUTH'){logout();return null;} toast(res.message||'บันทึกไม่สำเร็จ','err'); return null; }
-    a.id=res.id; toast('บันทึกร่างแล้ว ✓','ok'); return res.id;
+    a.id=res.id; state.assign.listLoaded=false; toast('บันทึกร่างแล้ว ✓','ok'); return res.id;
   }).catch(()=>{ toast('เชื่อมต่อไม่สำเร็จ','err'); return null; });
 }
 function asgPublish(){ asgSaveDraft().then(id=>{ if(!id)return;
   callServer('publishAssignment',state.token,id).then(res=>{ if(!res.ok){ toast(res.message||'เผยแพร่ไม่สำเร็จ','err'); return; }
-    toast('เผยแพร่แล้ว ✓','ok'); go('assign'); }); }); }
+    state.assign.listLoaded=false; state.assign.pubLoaded=false; toast('เผยแพร่แล้ว ✓','ok'); go('assign'); }); }); }
 function asgUnpublish(){ const a=state.assign.current; if(!a.id)return;
   callServer('unpublishAssignment',state.token,a.id).then(res=>{ if(!res.ok){ toast(res.message||'ไม่สำเร็จ','err'); return; }
-    a.status='draft'; toast('ยกเลิกเผยแพร่แล้ว','ok'); go('assign'); }); }
+    a.status='draft'; state.assign.listLoaded=false; state.assign.pubLoaded=false; toast('ยกเลิกเผยแพร่แล้ว','ok'); go('assign'); }); }
 function asgDelete(){ const a=state.assign.current; if(!a.id){ go('assign'); return; }
   $('#modalRoot').innerHTML=`<div class="sheet-backdrop" onclick="if(event.target===this)closeSheet()"><div class="sheet"><div class="sheet-grip"></div>
     <div class="section-title" style="font-size:16px">ลบตารางนี้?</div>
@@ -1120,7 +1192,7 @@ function asgDelete(){ const a=state.assign.current; if(!a.id){ go('assign'); ret
 }
 function asgDeleteConfirm(){ const a=state.assign.current;
   callServer('deleteAssignment',state.token,a.id).then(res=>{ closeSheet(); if(!res.ok){ toast(res.message||'ลบไม่สำเร็จ','err'); return; }
-    toast('ลบแล้ว','ok'); go('assign'); }); }
+    state.assign.listLoaded=false; state.assign.pubLoaded=false; toast('ลบแล้ว','ok'); go('assign'); }); }
 
 /* ---- Profile (แก้ไขข้อมูลส่วนตัวของตนเองได้ · ฟิลด์ตามคอลัมน์ชีต DATA) ---- */
 const PF_LABEL={Name:'ชื่อ-นามสกุล',User:'รหัสผู้ใช้ (User)',PIN:'PIN',Position:'ตำแหน่ง',Sex:'เพศ',Birthdate:'วันเกิด',Phone:'เบอร์โทร',INCHARGE:'INCHARGE'};
@@ -1164,13 +1236,19 @@ function renderProfile(){
       <div class="profile-name">${esc(u.Name)}</div>
       <div class="profile-pos"><span class="pos-tag pos-${posLabel(u.Position)}">${posLabel(u.Position)}</span></div>
       <button class="btn btn-ghost" style="margin-top:12px;width:auto;padding:8px 16px;font-size:13px" onclick="openAvatarPicker()">${ic('camera',{size:17})}เปลี่ยนรูปโปรไฟล์</button></div></div>
-    <div class="card" id="pfCard">${_spin}</div>
+    <div class="card" id="pfCard">${state.pf?pfFieldsHTML(state.pf):_spin}</div>
     <button class="btn btn-ghost" style="margin-bottom:12px" onclick="openProfileEdit()">${ic('pencil',{size:16})}แก้ไขข้อมูลส่วนตัว</button>
     <button class="btn btn-ghost" onclick="logout()">${ic('logout',{size:16})}ออกจากระบบ</button></div>`;
+  const had=!!state.pf;
   callServer('getMyProfile',state.token).then(res=>{
-    if(!res||!res.ok){ if(res&&res.code==='AUTH'){logout();return;} $('#pfCard').innerHTML='<div class="empty"><p>โหลดข้อมูลไม่สำเร็จ</p></div>'; return; }
+    if(state.tab!=='profile'||!$('#pfCard')) return;
+    if(!res||!res.ok){ if(res&&res.code==='AUTH'){logout();return;} if(!had) $('#pfCard').innerHTML='<div class="empty"><p>โหลดข้อมูลไม่สำเร็จ</p></div>'; return; }
     state.pf=res.fields||[]; if(state.user) state.user.photo=res.photo||state.user.photo||'';
-    $('#pfCard').innerHTML=res.fields.map(function(f){
+    $('#pfCard').innerHTML=pfFieldsHTML(state.pf);
+  }).catch(()=>{ if(!had&&$('#pfCard')) $('#pfCard').innerHTML='<div class="empty"><p>เชื่อมต่อไม่สำเร็จ</p></div>'; });
+}
+function pfFieldsHTML(fields){
+    return fields.map(function(f){
       const kind=fieldKind(f.key); let val;
       if(f.secret) val='••••';
       else if(kind==='incharge') val= truthy(f.value)?'<span style="color:var(--ok);font-weight:700;font-size:16px">✓</span>':'<span style="color:var(--line)">–</span>';
@@ -1181,7 +1259,6 @@ function renderProfile(){
       if(kind==='birthdate'&&f.value){ const age=computeAge(f.value); if(age!=='') row+=`<div class="detail-row"><span class="k">อายุ</span><span class="v">${age} ปี</span></div>`; }
       return row;
     }).join('');
-  }).catch(()=>{ $('#pfCard').innerHTML='<div class="empty"><p>เชื่อมต่อไม่สำเร็จ</p></div>'; });
 }
 /* ============================================================
    ตัวเลือกรูปโปรไฟล์ (Avatar Picker) — 3 แท็บ
@@ -1429,6 +1506,7 @@ function saveAvatarPending(){
     callServer('updateMyPhoto',state.token,url).then(function(res){
       if(!res||!res.ok){ reset(); if(res&&res.code==='AUTH'){logout();return;} toast((res&&res.message)||'บันทึกรูปไม่สำเร็จ','err'); return; }
       if(state.user) state.user.photo=url; setTopAvatar();
+      const bc=readBoot(); if(bc){ bc.photo=res.photo||url; saveBoot(bc); }
       const pa=$('#pfAvatar'); if(pa) pa.innerHTML=avatarInner(url,state.user.Name);
       closeSheet(); toast('เปลี่ยนรูปแล้ว ✓','ok');
     }).catch(function(){ reset(); toast('เชื่อมต่อไม่สำเร็จ','err'); });
@@ -1496,7 +1574,9 @@ function saveProfile(){
   callServer('updateMyProfile',state.token,payload).then(res=>{
     if(!res||!res.ok){ if(btn){btn.disabled=false;btn.textContent='บันทึก';} if(err)err.textContent=(res&&res.message)||'บันทึกไม่สำเร็จ'; return; }
     closeSheet(); toast('บันทึกข้อมูลแล้ว ✓','ok');
-    callServer('getBootstrap',state.token).then(bs=>{ if(bs&&bs.ok){ state.user=bs.user; state.user.photo=bs.photo||''; setTopAvatar(); } renderProfile(); });
+    const redraw=()=>{ setTopAvatar(); updateHeader(); renderProfile(); };
+    if(res.boot&&res.boot.ok){ applyBootstrap(res.boot); redraw(); }
+    else callServer('getBootstrap',state.token).then(bs=>{ if(bs&&bs.ok){ applyBootstrap(bs); } redraw(); }).catch(redraw);
   }).catch(()=>{ if(btn){btn.disabled=false;btn.textContent='บันทึก';} if(err)err.textContent='เชื่อมต่อไม่สำเร็จ'; });
 }
 

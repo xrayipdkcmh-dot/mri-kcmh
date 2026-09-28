@@ -1,5 +1,5 @@
 /* MRI KCMH — Service Worker (แคชหน้าแอปให้เปิดได้เร็ว/ออฟไลน์) */
-const CACHE = 'mri-kcmh-v1';
+const CACHE = 'mri-kcmh-v2';
 const ASSETS = [
   './', './index.html', './manifest.webmanifest', './favicon.ico',
   './icons/icon-192.png', './icons/icon-512.png',
@@ -7,7 +7,8 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  // cache:'reload' = ดึงไฟล์ใหม่จาก GitHub จริง ๆ ไม่ใช้ของเก่าในเบราว์เซอร์
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS.map(u => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', e => {
