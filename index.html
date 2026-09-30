@@ -456,6 +456,7 @@ function ic(n,o){ o=o||{}; const s=o.size||24, w=o.sw||1.9;
 /* ---- เรียก server ---- */
 /* ====== ตั้งค่า: วาง URL ของ Google Apps Script Web App (ลงท้าย /exec) ====== */
 const API_URL='https://script.google.com/macros/s/AKfycbxmysWF7OZ4tuQr-mPRcxKkV6R5aQxpCv-eMz8QLtfpbPNFIMtp3immCfRanwWFV5hZ/exec';
+const APP_VER='v'+'3';
 
 let _cbSeq=0;
 function _jsonp(action,payload,ms){
@@ -496,24 +497,49 @@ function _argsToPayload(action,a){
   }
 }
 /* คำขอขนาดใหญ่ (รูปโปรไฟล์ / ตาราง Assignment ยาว ๆ) — URL ยาวเกินที่ Google รับ → ส่ง POST แล้วดึงผลด้วย JSONP */
+/* ====== ส่งคำขอแบบ "ยิงสำรอง" (hedged request) ======
+   วัดจากเซิร์ฟเวอร์จริง: Google ตอบปกติ 1–3 วินาที แต่ราว 1 ใน 6 ครั้งค้าง 9–16 วินาที และบางครั้งล้มเหลวเลย
+   (เป็นที่ฝั่ง Google เอง แม้คำขอเปล่า ๆ ที่ไม่ทำอะไรก็เป็น) → ถ้าคำขอแรกยังไม่ตอบในไม่กี่วินาที ให้ยิงคำขอสำรองคู่ขนาน
+   แล้วใช้คำตอบที่มาถึงก่อน · ถ้าคำขอไหนล้มเหลวก็ยิงตัวใหม่ทันที โดยไม่ทิ้งคำขอที่ยังรออยู่ */
+const _HEDGE_READ=[0,3000,7000,12000], _HEDGE_WRITE=[0,7000,15000], _MAX_TRY=6, _OVERALL_MS=45000;
+function _hedged(action,payload,delays){
+  return new Promise((resolve,reject)=>{
+    let finished=false, launched=0, failed=0, lastErr=null; const timers=[];
+    const finish=(fn,v)=>{ if(finished) return; finished=true; timers.forEach(clearTimeout); fn(v); };
+    const launch=()=>{
+      if(finished||launched>=_MAX_TRY) return;
+      launched++;
+      _jsonp(action,payload,_OVERALL_MS).then(r=>finish(resolve,r),e=>{
+        if(finished) return;
+        lastErr=e; failed++;
+        if(String(e&&e.message).indexOf('API_URL')>=0){ finish(reject,e); return; }
+        if(launched<_MAX_TRY) timers.push(setTimeout(launch,400*failed));   // ล้มเหลว → ยิงตัวใหม่แทนเกือบทันที
+        else if(failed>=launched) finish(reject,lastErr);                    // ลองครบแล้วล้มเหลวทุกตัว
+      });
+    };
+    delays.forEach(d=>timers.push(setTimeout(launch,d)));
+    timers.push(setTimeout(()=>finish(reject,lastErr||new Error('timeout')),_OVERALL_MS+1000));
+  });
+}
 function _postLarge(action,payload){
   const nonce='n'+Date.now().toString(36)+Math.random().toString(36).slice(2,10);
   const body=JSON.stringify({action:action,payload:payload,nonce:nonce});
-  const poll=(i)=>_jsonp('result',{nonce:nonce}).then(r=>{
-    if(r&&r.pending){ if(i>=20) throw new Error('timeout'); return new Promise(ok=>setTimeout(ok,700)).then(()=>poll(i+1)); }
+  const send=()=>fetch(API_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:body}).catch(()=>null);
+  const poll=(i)=>_hedged('result',{nonce:nonce},_HEDGE_READ).then(r=>{
+    if(r&&r.pending){
+      if(i>=30) throw new Error('timeout');
+      const again=(i===12)?send():Promise.resolve();              // ยังไม่มีผล → ส่งซ้ำ 1 ครั้ง (server กันซ้ำด้วย _rid)
+      return again.then(()=>new Promise(ok=>setTimeout(ok,1000))).then(()=>poll(i+1)); }
     return r; });
-  return fetch(API_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:body})
-    .catch(()=>null).then(()=>poll(0));
+  return send().then(()=>poll(0));
 }
-/* คำสั่งที่ "อ่านอย่างเดียว" ลองใหม่อัตโนมัติ 1 ครั้งถ้าเน็ตสะดุด/เซิร์ฟเวอร์ตอบช้า (ผู้ใช้ไม่ต้องกดซ้ำเอง) */
-const _RETRY={login:1,getBootstrap:1,getMonthLeaves:1,listStaff:1,listAssignments:1,getAssignment:1,getPublishedAssignment:1,getMyProfile:1};
+/* คำสั่งอ่านข้อมูล ยิงสำรองได้เร็ว · คำสั่งบันทึกแนบรหัสคำขอ (_rid) ให้เซิร์ฟเวอร์ทำจริงแค่ครั้งเดียวแม้ส่งซ้ำ */
+const _READ={login:1,getBootstrap:1,getMonthLeaves:1,listStaff:1,listAssignments:1,getAssignment:1,getPublishedAssignment:1,getMyProfile:1,ping:1};
 function callServer(action,...args){
   const p=_argsToPayload(action,args);
+  if(!_READ[action]||action==='login') p._rid='w'+Date.now().toString(36)+Math.random().toString(36).slice(2,10);
   if(encodeURIComponent(JSON.stringify(p)).length>6000) return _postLarge(action,p);
-  return _jsonp(action,p,15000).catch(e=>{
-    if(!_RETRY[action]||String(e&&e.message).indexOf('API_URL')>=0) throw e;
-    return new Promise(ok=>setTimeout(ok,500)).then(()=>_jsonp(action,p,25000));
-  });
+  return _hedged(action,p,_READ[action]?_HEDGE_READ:_HEDGE_WRITE);
 }
 /* ปลุกเซิร์ฟเวอร์ Google ล่วงหน้าตอนเปิดหน้าล็อกอิน (ระหว่างที่ผู้ใช้พิมพ์ User/PIN) */
 function warmUp(){ try{ _jsonp('ping',{},20000).catch(()=>{}); }catch(e){} }
@@ -1238,7 +1264,8 @@ function renderProfile(){
       <button class="btn btn-ghost" style="margin-top:12px;width:auto;padding:8px 16px;font-size:13px" onclick="openAvatarPicker()">${ic('camera',{size:17})}เปลี่ยนรูปโปรไฟล์</button></div></div>
     <div class="card" id="pfCard">${state.pf?pfFieldsHTML(state.pf):_spin}</div>
     <button class="btn btn-ghost" style="margin-bottom:12px" onclick="openProfileEdit()">${ic('pencil',{size:16})}แก้ไขข้อมูลส่วนตัว</button>
-    <button class="btn btn-ghost" onclick="logout()">${ic('logout',{size:16})}ออกจากระบบ</button></div>`;
+    <button class="btn btn-ghost" onclick="logout()">${ic('logout',{size:16})}ออกจากระบบ</button>
+    ${typeof APP_VER!=='undefined'?'<div style="text-align:center;font-size:11.5px;color:var(--muted);margin-top:14px">เวอร์ชันแอป '+APP_VER+'</div>':''}</div>`;
   const had=!!state.pf;
   callServer('getMyProfile',state.token).then(res=>{
     if(state.tab!=='profile'||!$('#pfCard')) return;
@@ -1582,6 +1609,9 @@ function saveProfile(){
 
 document.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!$('#loginScreen').classList.contains('hidden')) doLogin(); });
 
+/* ====== แสดงเลขเวอร์ชันบนหน้าล็อกอิน (ไว้เช็กว่ามือถือได้ของใหม่แล้ว) ====== */
+(function(){ const c=document.querySelector('#loginScreen .login-card'); if(c){ const d=document.createElement('div');
+  d.style.cssText='margin-top:14px;font-size:11.5px;color:#94a3b8;text-align:center'; d.textContent='เวอร์ชันแอป '+APP_VER; c.appendChild(d); } })();
 /* ====== PWA: service worker + ปุ่มติดตั้ง ====== */
 if('serviceWorker' in navigator){ window.addEventListener('load',()=>navigator.serviceWorker.register('service-worker.js').catch(()=>{})); }
 let _deferredPrompt=null;
